@@ -1,0 +1,159 @@
+name: Code sign with SoftHSM (Test Certificate)
+on:
+  workflow_dispatch:
+    inputs:
+      workflow:
+        description: 'Workflow file name or ID'
+        required: true
+        type: string
+      run_id:
+        description: 'Workflow run ID to use'
+        required: true
+        type: string
+      artifact:
+        description: 'Name of artifact to download'
+        required: true
+        type: string
+      exe_name:
+        description: 'Name of executable file to sign'
+        required: true
+        type: string
+      rcodesign_branch:
+        description: 'Name of branch to obtain rcodesign executable from'
+        required: false
+        default: main
+      pkcs11_pin:
+        description: 'PKCS#11 PIN for SoftHSM token'
+        required: false
+        default: '12345'
+      key_label:
+        description: 'PKCS#11 key label'
+        required: false
+        default: 'mykey'
+
+jobs:
+  sign:
+    name: Sign ${{ github.event.inputs.exe_name }} with SoftHSM
+    runs-on: 'ubuntu-22.04'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install SoftHSM and PKCS#11 tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y softhsm2 openssl opensc-pkcs11
+
+      - name: Setup SoftHSM token
+        run: |
+          # Create SoftHSM configuration directory
+          mkdir -p ~/.config/softhsm2
+
+          # Initialize token
+          softhsm2-util --init-token --slot 0 --label "CodeSigning" --so-pin 123456 --pin ${{ github.event.inputs.pkcs11_pin }}
+
+          # List tokens to verify setup
+          softhsm2-util --show-slots
+
+          # Get the slot ID of the initialized token (with label "CodeSigning")
+          SLOT_ID=$(softhsm2-util --show-slots | awk '/^Slot [0-9]/ {slot=$2} /Label:.*CodeSigning/ {print slot; exit}')
+          echo "SLOT_ID=$SLOT_ID" >> $GITHUB_ENV
+          echo "Using slot ID: $SLOT_ID"
+        env:
+          SOFTHSM2_CONF: ${{ github.workspace }}/softhsm2.conf
+
+      - name: Create SoftHSM config
+        run: |
+          cat > softhsm2.conf << EOF
+          directories.tokendir = ${{ github.workspace }}/tokens/
+          objectstore.backend = file
+          log.level = DEBUG
+          EOF
+          mkdir -p tokens/
+
+      - name: Download rcodesign Linux executable
+        uses: dawidd6/action-download-artifact@9662f5cf4983f094c5b142e8fec9ddea560ca302
+        with:
+          repo: ${{github.repository}}
+          workflow: '.github/workflows/rcodesign.yml'
+          workflow_conclusion: success
+          branch: ${{ github.event.inputs.rcodesign_branch }}
+          event: push
+          name: exe-rcodesign-x86_64-unknown-linux-musl
+          path: bins/
+
+      - name: Download artifact to sign
+        uses: dawidd6/action-download-artifact@9662f5cf4983f094c5b142e8fec9ddea560ca302
+        with:
+          repo: ${{ github.repository }}
+          workflow: ${{ github.event.inputs.workflow }}
+          run_id: ${{ github.event.inputs.run_id }}
+          workflow_conclusion: completed
+          name: ${{ github.event.inputs.artifact }}
+          path: dist/input
+
+      # Create test certificate and private key dynamically
+      - name: Create test certificate and private key
+        run: |
+          # Generate a private key
+          openssl genrsa -out private_key.pem 2048
+
+          # Create a self-signed certificate (for testing)
+          openssl req -new -x509 -key private_key.pem -out test_cert.pem -days 365 -subj "/CN=Test Code Signing/O=Test Organization/C=US"
+
+          # Convert certificate to DER format (what PKCS#11 expects)
+          openssl x509 -in test_cert.pem -outform DER -out developerID_application.cer
+
+          # Import certificate
+          pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
+            --login --pin ${{ github.event.inputs.pkcs11_pin }} \
+            --slot $SLOT_ID \
+            --write-object developerID_application.cer \
+            --type cert \
+            --label "cert"
+
+          # Import private key
+          pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
+            --login --pin ${{ github.event.inputs.pkcs11_pin }} \
+            --slot $SLOT_ID \
+            --write-object private_key.pem \
+            --type privkey \
+            --label ${{ github.event.inputs.key_label }}
+        env:
+          SOFTHSM2_CONF: ${{ github.workspace }}/softhsm2.conf
+
+      - name: List PKCS#11 objects (debug)
+        run: |
+          pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
+            --login --pin ${{ github.event.inputs.pkcs11_pin }} \
+            --slot $SLOT_ID \
+            --list-objects
+        env:
+          SOFTHSM2_CONF: ${{ github.workspace }}/softhsm2.conf
+
+      - name: Perform SoftHSM code signing
+        run: |
+          # Ensure output directory exists
+          mkdir -p dist/output
+
+          # Make rcodesign executable
+          chmod +x bins/rcodesign
+
+          # Sign the executable
+          bins/rcodesign sign \
+              --pkcs11-library /usr/lib/softhsm/libsofthsm2.so \
+              --pkcs11-certificate-file developerID_application.cer \
+              --pkcs11-key-label ${{ github.event.inputs.key_label }} \
+              --pkcs11-slot-id $SLOT_ID \
+              --pkcs11-pin ${{ github.event.inputs.pkcs11_pin }} \
+              --code-signature-flags runtime \
+              dist/input/${{ github.event.inputs.exe_name }} \
+              dist/output/${{ github.event.inputs.exe_name }}
+        env:
+          SOFTHSM2_CONF: ${{ github.workspace }}/softhsm2.conf
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: exe-${{ github.event.inputs.exe_name }}-softhsm-signed
+          path: dist/output/${{ github.event.inputs.exe_name }}
